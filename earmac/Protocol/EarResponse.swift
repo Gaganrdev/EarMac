@@ -101,9 +101,9 @@ extension EarResponse {
     }
 
     func parseCustomEQ() -> EQPresetCustom? {
-        let bassOffset = 6
-        let midOffset = 19
-        let trebleOffset = 32
+        let midOffset = 6
+        let trebleOffset = 19
+        let bassOffset = 32
 
         func readFloat(at offset: Int) -> Float? {
             guard payload.count >= offset + 4 else { return nil }

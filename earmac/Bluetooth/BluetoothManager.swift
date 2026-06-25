@@ -416,7 +416,8 @@ final class BluetoothManager {
             ancMode = response.parseANCMode()
             isSwitchingANC = false
 
-        case EarCommand.Response.eqA, EarCommand.Response.eqB:
+        case EarCommand.Response.eqA, EarCommand.Response.eqB,
+             EarCommand.Response.listeningMode:
             eqPreset = response.parseEQPreset()
             isSwitchingEQ = false
 

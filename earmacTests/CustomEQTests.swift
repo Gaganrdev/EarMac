@@ -60,4 +60,24 @@ final class CustomEQTests: XCTestCase {
         XCTAssertEqual(specs.freqPeak, 980.0)
         XCTAssertEqual(specs.freqLow, 140.0)
     }
+
+    func testParseCustomEQRoundTrip() {
+        let original = EQPresetCustom(bass: 5, mid: -3, treble: 2)
+        let payload = original.encodedPayload(specs: .defaultSpecs)
+
+        var bytes: [UInt8] = [
+            0x55, 0x60, 0x01,
+            0x44, 0x40,
+            UInt8(payload.count),
+            0x00, 0x01,
+        ]
+        bytes.append(contentsOf: payload)
+
+        let response = EarResponse(bytes)
+        XCTAssertNotNil(response)
+        let parsed = response?.parseCustomEQ()
+        XCTAssertEqual(parsed?.bass, 5, "Bass should round-trip correctly")
+        XCTAssertEqual(parsed?.mid, -3, "Mid should round-trip correctly")
+        XCTAssertEqual(parsed?.treble, 2, "Treble should round-trip correctly")
+    }
 }

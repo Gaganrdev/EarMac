@@ -34,6 +34,7 @@ enum EarCommand: Sendable {
         static let ancB: UInt16            = 0x401E
         static let eqA: UInt16             = 0x401F
         static let eqB: UInt16             = 0x4040
+        static let listeningMode: UInt16   = 0x4050
         static let customEQ: UInt16        = 0x4044
         static let advancedEQ: UInt16      = 0x404C
         static let advancedEQWrite: UInt16 = 0x706F

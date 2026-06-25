@@ -1,5 +1,18 @@
 import Foundation
 @preconcurrency import CoreBluetooth
+import UserNotifications
+
+private func earLog(_ message: String) {
+    let line = "[earmac] " + message + "\n"
+    let path = "/tmp/earmac-debug.log"
+    if let handle = FileHandle(forWritingAtPath: path) {
+        handle.seekToEndOfFile()
+        handle.write(Data(line.utf8))
+        handle.closeFile()
+    } else {
+        try? line.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+}
 
 enum ConnectionState: Sendable, Equatable {
     case disconnected
@@ -30,6 +43,17 @@ final class BluetoothManager {
     var battery: BatteryInfo?
     var ancMode: ANCMode?
     var isSwitchingANC = false
+
+    var eqPreset: EQPreset?
+    var customEQ: EQPresetCustom?
+    var isAdvancedEQEnabled: Bool?
+    var spatialAudioMode: SpatialAudioMode?
+    var inEarDetection: Bool?
+    var isSwitchingEQ = false
+    var isSwitchingSpatial = false
+    var isSwitchingInEar = false
+
+    var autoReconnect = UserDefaults.standard.bool(forKey: "autoReconnect")
 
     var isConnected: Bool {
         if case .connected = connectionState { return true }
@@ -62,6 +86,9 @@ final class BluetoothManager {
     private var operationID: UInt8 = 1
     private var batteryPollingTask: Task<Void, Never>?
     private var connectionTimeoutTask: Task<Void, Never>?
+    private var reconnectTask: Task<Void, Never>?
+    private var reconnectAttempts = 0
+    private var lastLowBatteryNotification: [String: Date] = [:]
 
     private var hasSerialNumber = false
     private var hasFirmware = false
@@ -70,19 +97,28 @@ final class BluetoothManager {
     init() {
         let delegate = BluetoothDelegate()
         self.delegate = delegate
-        self.centralManager = CBCentralManager(delegate: delegate, queue: nil)
         delegate.manager = self
+        self.centralManager = CBCentralManager(delegate: delegate, queue: .main)
     }
 
     func startConnecting() {
-        guard let cm = centralManager, cm.state == .poweredOn else {
+        guard let cm = centralManager else {
+            earLog("startConnecting: centralManager is nil")
+            return
+        }
+        guard cm.state == .poweredOn else {
+            earLog("startConnecting: Bluetooth not powered on (state=\(cm.state.rawValue))")
             connectionState = .poweredOff
             return
         }
+        earLog("startConnecting: Bluetooth powered on, attempting connection")
+        reconnectAttempts = 0
         connectToKnownDeviceOrScan()
     }
 
     func disconnect() {
+        earLog("disconnect: user-initiated disconnect")
+        reconnectAttempts = 3
         batteryPollingTask?.cancel()
         batteryPollingTask = nil
         if let peripheral = connectedPeripheral, let cm = centralManager {
@@ -96,16 +132,93 @@ final class BluetoothManager {
         sendRequest(EarRequest.setANC(mode, opID: nextOperationID()))
     }
 
+    func setEQPreset(_ preset: EQPreset) {
+        guard isConnected else { return }
+        isSwitchingEQ = true
+        if deviceModel.supportsListeningMode {
+            sendRequest(EarRequest.setListeningMode(preset, opID: nextOperationID()))
+        } else {
+            sendRequest(EarRequest.setEQPreset(preset, opID: nextOperationID()))
+        }
+    }
+
+    func setCustomEQ(_ custom: EQPresetCustom) {
+        guard isConnected else { return }
+        isSwitchingEQ = true
+        sendRequest(EarRequest.setCustomEQ(custom, specs: deviceModel.eqPresetCustomSpecs, opID: nextOperationID()))
+    }
+
+    func setAdvancedEQ(enabled: Bool) {
+        guard isConnected else { return }
+        isSwitchingEQ = true
+        sendRequest(EarRequest.setAdvancedEQ(enabled: enabled, opID: nextOperationID()))
+    }
+
+    func setSpatialAudio(_ mode: SpatialAudioMode) {
+        guard isConnected else { return }
+        isSwitchingSpatial = true
+        sendRequest(EarRequest.setSpatialAudio(mode, opID: nextOperationID()))
+    }
+
+    func setInEarDetection(_ enabled: Bool) {
+        guard isConnected else { return }
+        isSwitchingInEar = true
+        sendRequest(EarRequest.setInEarDetection(enabled, opID: nextOperationID()))
+    }
+
+    private let knownDeviceNames: Set<String> = [
+        "Nothing ear (1)", "Ear (Stick)", "Ear (2)", "Nothing Ear",
+        "Nothing Ear (a)", "Nothing Ear (open)", "Nothing Ear (3)",
+        "Nothing Headphone (1)", "Nothing Headphone (a)",
+        "Buds Pro", "Neckband Pro", "CMF Buds", "CMF Buds Pro 2",
+        "CMF Buds 2", "CMF Buds 2 Plus", "CMF Buds 2a",
+        "CMF Headphone Pro"
+    ]
+
+    private func isKnownDevice(_ name: String?) -> Bool {
+        guard let name else { return false }
+        return knownDeviceNames.contains { name.contains($0) }
+    }
+
     private func connectToKnownDeviceOrScan() {
         guard let cm = centralManager else { return }
+
         let known = cm.retrieveConnectedPeripherals(withServices: [fastPairUUID])
-        if let peripheral = known.first {
+        earLog("connectToKnownDeviceOrScan: found \(known.count) already-connected peripherals with FE2C")
+
+        for peripheral in known {
+            earLog("connectToKnownDeviceOrScan: checking '\(peripheral.name ?? "unknown")' isKnown=\(isKnownDevice(peripheral.name))")
+        }
+
+        if let peripheral = known.first(where: { isKnownDevice($0.name) }) {
+            earLog("connectToKnownDeviceOrScan: connecting to '\(peripheral.name ?? "unknown")'")
             connectionState = .connecting
             connect(to: peripheral)
             return
         }
+
+        earLog("connectToKnownDeviceOrScan: no known peripherals, starting scan for FE2C")
         connectionState = .scanning
-        cm.scanForPeripherals(withServices: [fastPairUUID])
+        cm.scanForPeripherals(withServices: [fastPairUUID], options: [
+            CBCentralManagerScanOptionAllowDuplicatesKey: false
+        ])
+
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            if case .scanning = connectionState {
+                earLog("connectToKnownDeviceOrScan: FE2C scan timed out after 10s, trying open scan")
+                cm.stopScan()
+                cm.scanForPeripherals(withServices: nil, options: nil)
+                connectionState = .scanning
+
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                if case .scanning = connectionState {
+                    earLog("connectToKnownDeviceOrScan: open scan also timed out, no devices found")
+                    cm.stopScan()
+                    connectionState = .error("No earbuds found nearby")
+                }
+            }
+        }
     }
 
     private func connect(to peripheral: CBPeripheral) {
@@ -123,22 +236,27 @@ final class BluetoothManager {
     private func sendRequest(_ frame: EarFrame) {
         guard let peripheral = connectedPeripheral,
               let writeChar = writeCharacteristic else {
+            earLog("sendRequest: no peripheral or write characteristic")
             return
         }
         let data = Data(frame.encoded())
-        peripheral.writeValue(data, for: writeChar, type: .withResponse)
+        let hex = data.map { String(format: "%02X", $0) }.joined(separator: " ")
+        earLog("sendRequest: cmd=0x\(String(frame.command, radix: 16)) \(data.count) bytes: \(hex)")
+        peripheral.writeValue(data, for: writeChar, type: .withoutResponse)
     }
 
     private func queryInitialDeviceInfo() {
+        earLog("queryInitialDeviceInfo: starting")
         hasSerialNumber = false
         hasFirmware = false
         isInitialQueryComplete = false
 
         connectionTimeoutTask?.cancel()
         connectionTimeoutTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
             guard !Task.isCancelled else { return }
             if !isInitialQueryComplete {
+                earLog("queryInitialDeviceInfo: TIMEOUT")
                 connectionState = .error("Connection timed out")
                 if let p = connectedPeripheral, let cm = centralManager {
                     cm.cancelPeripheralConnection(p)
@@ -147,11 +265,6 @@ final class BluetoothManager {
         }
 
         sendRequest(EarRequest.readSerialNumber(opID: nextOperationID()))
-
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            sendRequest(EarRequest.readFirmware(opID: nextOperationID()))
-        }
     }
 
     private func completeInitialQuery() {
@@ -159,19 +272,66 @@ final class BluetoothManager {
         isInitialQueryComplete = true
         connectionTimeoutTask?.cancel()
         connectionTimeoutTask = nil
+        reconnectAttempts = 0
 
         connectionState = .connected
 
         sendRequest(EarRequest.readBattery(opID: nextOperationID()))
 
-        if deviceModel.supportsANC {
+        let tasks: [(TimeInterval, () -> Void)] = [
+            (0.2, { self.sendRequest(self.deviceModel.supportsANC ? EarRequest.readANC(opID: self.nextOperationID()) : nil) }),
+            (0.4, { self.queryAudioFeatures() }),
+            (0.6, { self.queryFeatureSettings() }),
+        ]
+
+        for (delay, task) in tasks {
             Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 200_000_000)
-                sendRequest(EarRequest.readANC(opID: nextOperationID()))
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                task()
             }
         }
 
         startBatteryPolling()
+    }
+
+    private func queryAudioFeatures() {
+        if deviceModel.supportsListeningMode {
+            sendRequest(EarRequest.readListeningMode(opID: nextOperationID()))
+        } else if deviceModel.supportsEQ {
+            sendRequest(EarRequest.readEQ(opID: nextOperationID()))
+        }
+
+        if deviceModel.supportsCustomEQ {
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                sendRequest(EarRequest.readCustomEQ(opID: nextOperationID()))
+            }
+        }
+
+        if deviceModel.supportsAdvancedEQ {
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                sendRequest(EarRequest.readAdvancedEQ(opID: nextOperationID()))
+            }
+        }
+
+        if deviceModel.supportsSpatialAudio {
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                sendRequest(EarRequest.readSpatialAudio(opID: nextOperationID()))
+            }
+        }
+    }
+
+    private func queryFeatureSettings() {
+        if deviceModel.supportsInEarDetection {
+            sendRequest(EarRequest.readInEarDetection(opID: nextOperationID()))
+        }
+    }
+
+    private func sendRequest(_ frame: EarFrame?) {
+        guard let frame else { return }
+        sendRequest(frame)
     }
 
     private func startBatteryPolling() {
@@ -203,22 +363,41 @@ final class BluetoothManager {
         battery = nil
         ancMode = nil
         isSwitchingANC = false
+        eqPreset = nil
+        customEQ = nil
+        isAdvancedEQEnabled = nil
+        spatialAudioMode = nil
+        inEarDetection = nil
+        isSwitchingEQ = false
+        isSwitchingSpatial = false
+        isSwitchingInEar = false
+        lastLowBatteryNotification.removeAll()
     }
 
     private func processResponse(_ data: Data) {
         guard let response = EarResponse(Array(data)) else {
+            earLog("processResponse: failed to parse \(data.map { String(format: "%02X", $0) }.joined(separator: " "))")
             return
         }
+
+        earLog("processResponse: cmd=0x\(String(response.command, radix: 16)) payload=\(response.payload.map { String(format: "%02X", $0) }.joined(separator: " "))")
 
         switch response.command {
         case EarCommand.Response.serialNumber:
             let name = connectedPeripheral?.name ?? "Unknown"
             if let serial = response.parseSerialNumber() {
+                earLog("processResponse: got serial number")
                 serialNumber = serial
                 deviceModel = DeviceModel.detect(deviceName: name, serialNumber: serial)
                 deviceName = deviceModel == .unknown ? name : deviceModel.displayName
                 hasSerialNumber = true
-                completeInitialQuery()
+
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    sendRequest(EarRequest.readFirmware(opID: nextOperationID()))
+                }
+            } else {
+                earLog("processResponse: failed to parse serial number")
             }
 
         case EarCommand.Response.firmware:
@@ -231,13 +410,83 @@ final class BluetoothManager {
 
         case EarCommand.Response.batteryA, EarCommand.Response.batteryB:
             battery = response.parseBattery()
+            checkLowBattery()
 
         case EarCommand.Response.ancA, EarCommand.Response.ancB:
             ancMode = response.parseANCMode()
             isSwitchingANC = false
 
+        case EarCommand.Response.eqA, EarCommand.Response.eqB:
+            eqPreset = response.parseEQPreset()
+            isSwitchingEQ = false
+
+        case EarCommand.Response.customEQ:
+            customEQ = response.parseCustomEQ()
+            isSwitchingEQ = false
+
+        case EarCommand.Response.advancedEQ, EarCommand.Response.advancedEQWrite:
+            if response.payload.isEmpty {
+                isAdvancedEQEnabled = false
+            } else {
+                isAdvancedEQEnabled = response.payload[0] != 0
+            }
+            isSwitchingEQ = false
+
+        case EarCommand.Response.spatialAudio:
+            spatialAudioMode = response.parseSpatialAudioMode()
+            isSwitchingSpatial = false
+
+        case EarCommand.Response.inEarDetection:
+            inEarDetection = response.parseInEarDetection()
+            isSwitchingInEar = false
+
         default:
             break
+        }
+    }
+
+    private func checkLowBattery() {
+        guard let battery,
+              UserDefaults.standard.bool(forKey: "lowBatteryNotifications")
+        else { return }
+
+        checkLowBatteryFor(battery.leftBud, budName: "Left bud")
+        checkLowBatteryFor(battery.rightBud, budName: "Right bud")
+        checkLowBatteryFor(battery.caseBattery, budName: "Case")
+    }
+
+    private func checkLowBatteryFor(_ level: BatteryLevel, budName: String) {
+        guard level.isConnected, !level.isCharging, level.level <= (thresholdValue) else { return }
+
+        if let lastNotified = lastLowBatteryNotification[budName],
+           Date().timeIntervalSince(lastNotified) < 300
+        {
+            return
+        }
+
+        lastLowBatteryNotification[budName] = Date()
+        NotificationManager.shared.sendLowBattery(level: level.level, budName: budName)
+    }
+
+    private var thresholdValue: Int {
+        let t = UserDefaults.standard.integer(forKey: "lowBatteryThreshold")
+        return t > 0 ? t : 15
+    }
+
+    private func attemptAutoReconnect() {
+        guard autoReconnect, reconnectAttempts < 3 else {
+            connectionState = .disconnected
+            return
+        }
+
+        reconnectAttempts += 1
+        connectionState = .disconnected
+
+        reconnectTask?.cancel()
+        reconnectTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled, autoReconnect else { return }
+            startConnecting()
         }
     }
 
@@ -261,6 +510,7 @@ final class BluetoothManager {
 extension BluetoothManager {
 
     func handleCentralStateChange(_ state: CBManagerState) {
+        earLog("handleCentralStateChange: state=\(state.rawValue)")
         switch state {
         case .poweredOn:
             if connectionState == .disconnected || connectionState == .poweredOff {
@@ -276,10 +526,14 @@ extension BluetoothManager {
     }
 
     func handleDiscoveredPeripheral(_ peripheral: CBPeripheral) {
+        let name = peripheral.name ?? "unknown"
+        earLog("handleDiscoveredPeripheral: '\(name)' isKnown=\(isKnownDevice(peripheral.name))")
+        guard isKnownDevice(peripheral.name) else { return }
         connect(to: peripheral)
     }
 
     func handleConnected(_ peripheral: CBPeripheral) {
+        earLog("handleConnected: '\(peripheral.name ?? "unknown")'")
         connectionState = .discoveringServices
         deviceName = peripheral.name
         peripheral.delegate = delegate
@@ -287,24 +541,41 @@ extension BluetoothManager {
     }
 
     func handleFailedToConnect(_ message: String) {
+        earLog("handleFailedToConnect: \(message)")
         resetState()
-        connectionState = .error(message)
+        if autoReconnect && reconnectAttempts < 3 {
+            attemptAutoReconnect()
+        } else {
+            connectionState = .error(message)
+        }
     }
 
     func handleDisconnected() {
+        earLog("handleDisconnected")
+        let wasConnected = isConnected
         resetState()
-        connectionState = .disconnected
+        if wasConnected && autoReconnect {
+            attemptAutoReconnect()
+        } else {
+            connectionState = .disconnected
+        }
     }
 
     func handleDiscoveredServices(_ peripheral: CBPeripheral, error: Error?) {
         guard let services = peripheral.services, error == nil else {
+            earLog("handleDiscoveredServices: no services")
             connectionState = .error("No services found")
             return
         }
 
+        earLog("handleDiscoveredServices: \(services.count) services")
+        for s in services { earLog("  service: \(s.uuid.uuidString)") }
+
         let candidates = services.filter { service in
             !standardServices.contains(service.uuid.uuidString.uppercased())
         }
+
+        earLog("handleDiscoveredServices: \(candidates.count) proprietary candidates")
 
         candidateServices = candidates
         servicesToCheck = candidates.count
@@ -328,10 +599,14 @@ extension BluetoothManager {
             return
         }
 
+        earLog("handleDiscoveredCharacteristics: \(characteristics.count) chars for \(service.uuid.uuidString)")
+
         var foundWrite: CBCharacteristic?
         var foundNotify: CBCharacteristic?
 
         for char in characteristics {
+            earLog("  char: \(char.uuid.uuidString) props=\(char.properties.rawValue)")
+
             if char.properties.contains(.write) || char.properties.contains(.writeWithoutResponse) {
                 foundWrite = char
             }
@@ -347,6 +622,7 @@ extension BluetoothManager {
             bestServiceScore = score
             writeCharacteristic = write
             notifyCharacteristic = notify
+            earLog("  selected write=\(write.uuid.uuidString) notify=\(notify.uuid.uuidString)")
         }
 
         servicesChecked += 1
@@ -363,11 +639,33 @@ extension BluetoothManager {
         guard let notify = notifyCharacteristic,
               let peripheral = connectedPeripheral,
               writeCharacteristic != nil else {
+            earLog("checkServiceDiscoveryComplete: no write/notify found")
             connectionState = .error("No write/notify characteristics found")
             return
         }
 
+        earLog("checkServiceDiscoveryComplete: subscribing to notify \(notify.uuid.uuidString)")
         peripheral.setNotifyValue(true, for: notify)
-        queryInitialDeviceInfo()
+    }
+
+    func handleNotifySubscription(_ characteristic: CBCharacteristic, error: Error?) {
+        if let error {
+            earLog("handleNotifySubscription: FAILED - \(error.localizedDescription)")
+            connectionState = .error("Failed to subscribe: \(error.localizedDescription)")
+            return
+        }
+
+        earLog("handleNotifySubscription: subscribed successfully to \(characteristic.uuid.uuidString)")
+
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            queryInitialDeviceInfo()
+        }
+    }
+
+    func handleWriteResult(_ characteristic: CBCharacteristic, error: Error?) {
+        if let error {
+            earLog("handleWriteResult: WRITE FAILED - \(error.localizedDescription)")
+        }
     }
 }

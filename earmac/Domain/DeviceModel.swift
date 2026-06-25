@@ -76,6 +76,72 @@ enum DeviceModel: Sendable, Equatable {
         }
     }
 
+    var supportsSpatialAudio: Bool {
+        switch self {
+        case .ear3, .headphone1, .headphoneA, .cmfBuds2, .cmfBuds2Plus,
+             .cmfBudsPro2, .cmfNeckbandPro, .cmfHeadphonePro:
+            return true
+        default:
+            return false
+        }
+    }
+
+    var supportedSpatialAudioModes: [SpatialAudioMode] {
+        switch self {
+        case .headphone1, .headphoneA:
+            return [.off, .fixed, .headTracking]
+        case .ear3, .cmfBuds2, .cmfBuds2Plus, .cmfBudsPro2, .cmfNeckbandPro:
+            return [.off, .fixed]
+        case .cmfHeadphonePro:
+            return [.off, .cinema, .concert]
+        default:
+            return []
+        }
+    }
+
+    var supportsEQ: Bool {
+        switch self {
+        case .unknown: return false
+        default: return true
+        }
+    }
+
+    var supportsCustomEQ: Bool {
+        self != .ear1 && self != .unknown
+    }
+
+    var supportsAdvancedEQ: Bool {
+        self != .cmfNeckbandPro && self != .unknown
+    }
+
+    var supportsInEarDetection: Bool {
+        self != .earOpen && self != .unknown
+    }
+
+    var supportsListeningMode: Bool {
+        switch self {
+        case .cmfBuds, .cmfBuds2a, .cmfBuds2, .cmfBuds2Plus, .cmfBudsPro2:
+            return true
+        default:
+            return false
+        }
+    }
+
+    var eqPresetCustomSpecs: EQPresetCustomSpecs {
+        switch self {
+        case .headphone1, .headphoneA, .cmfHeadphonePro:
+            return EQPresetCustomSpecs(freqLow: 140.0, qLow: 0.8, freqPeak: 980.0, qPeak: 0.7, freqHigh: 3500.0, qHigh: 1.0)
+        case .earStick:
+            return EQPresetCustomSpecs(freqLow: 140.0, qLow: 0.8, freqPeak: 980.0, qPeak: 0.66, freqHigh: 3500.0, qHigh: 1.0)
+        case .ear1, .ear2, .ear3, .earOpen, .ear, .earA, .cmfBudsPro:
+            return EQPresetCustomSpecs(freqLow: 140.0, qLow: 0.8, freqPeak: 980.0, qPeak: 0.7, freqHigh: 3400.0, qHigh: 1.0)
+        case .cmfBuds, .cmfBuds2a, .cmfBuds2, .cmfBuds2Plus, .cmfBudsPro2, .cmfNeckbandPro:
+            return EQPresetCustomSpecs(freqLow: 140.0, qLow: 0.8, freqPeak: 980.0, qPeak: 0.7, freqHigh: 6900.0, qHigh: 1.0)
+        case .unknown:
+            return .defaultSpecs
+        }
+    }
+
     static func detect(deviceName: String, serialNumber: String) -> DeviceModel {
         if let model = detectFromSerial(serialNumber) {
             return model

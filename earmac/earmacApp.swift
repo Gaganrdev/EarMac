@@ -10,6 +10,11 @@ struct earmacApp: App {
                 .environment(bluetooth)
         }
         .menuBarExtraStyle(.window)
+
+        Settings {
+            SettingsRootView()
+                .environment(bluetooth)
+        }
     }
 
     private var menuBarIcon: String {

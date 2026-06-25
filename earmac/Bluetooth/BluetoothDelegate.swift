@@ -74,4 +74,24 @@ nonisolated final class BluetoothDelegate: NSObject, CBCentralManagerDelegate, C
             manager?.handleCharacteristicData(data)
         }
     }
+
+    nonisolated func peripheral(
+        _ peripheral: CBPeripheral,
+        didUpdateNotificationStateFor characteristic: CBCharacteristic,
+        error: Error?
+    ) {
+        Task { @MainActor in
+            manager?.handleNotifySubscription(characteristic, error: error)
+        }
+    }
+
+    nonisolated func peripheral(
+        _ peripheral: CBPeripheral,
+        didWriteValueFor characteristic: CBCharacteristic,
+        error: Error?
+    ) {
+        Task { @MainActor in
+            manager?.handleWriteResult(characteristic, error: error)
+        }
+    }
 }

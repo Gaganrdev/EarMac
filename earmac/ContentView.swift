@@ -119,6 +119,7 @@ struct DisconnectedView: View {
 
 struct ConnectedView: View {
     @Environment(BluetoothManager.self) private var bluetooth
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         VStack(spacing: 12) {
@@ -132,12 +133,36 @@ struct ConnectedView: View {
                 ANCControlCard()
             }
 
+            if bluetooth.deviceModel.supportsSpatialAudio {
+                SpatialAudioCard()
+            }
+
             InfoFooter()
 
             Divider()
                 .padding(.horizontal, 16)
 
-            DisconnectButton()
+            HStack(spacing: 12) {
+                Button {
+                    openSettings()
+                } label: {
+                    Label("Settings", systemImage: "gearshape")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.regular)
+
+                Button {
+                    bluetooth.disconnect()
+                } label: {
+                    Label("Disconnect", systemImage: "power")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.regular)
+                .tint(.red)
+            }
+            .padding(.horizontal, 16)
         }
         .padding(.top, 16)
         .padding(.bottom, 12)
@@ -384,21 +409,73 @@ struct InfoFooter: View {
     }
 }
 
-// MARK: - Disconnect Button
+// MARK: - Spatial Audio
 
-struct DisconnectButton: View {
+struct SpatialAudioCard: View {
     @Environment(BluetoothManager.self) private var bluetooth
 
+    private var supportedModes: [SpatialAudioMode] {
+        bluetooth.deviceModel.supportedSpatialAudioModes
+    }
+
     var body: some View {
-        Button {
-            bluetooth.disconnect()
-        } label: {
-            Label("Disconnect", systemImage: "power")
-                .frame(maxWidth: .infinity)
+        VStack(spacing: 8) {
+            HStack {
+                Image(systemName: "sparkles")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Spatial Audio")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if bluetooth.isSwitchingSpatial {
+                    ProgressView()
+                        .controlSize(.mini)
+                }
+            }
+
+            HStack(spacing: 6) {
+                ForEach(supportedModes, id: \.self) { mode in
+                    SpatialAudioButton(
+                        mode: mode,
+                        isSelected: bluetooth.spatialAudioMode == mode,
+                        isDisabled: bluetooth.isSwitchingSpatial
+                    ) {
+                        bluetooth.setSpatialAudio(mode)
+                    }
+                }
+            }
         }
-        .buttonStyle(.bordered)
-        .controlSize(.regular)
-        .tint(.red)
+        .padding(12)
+        .background(.quinary.opacity(0.5), in: .rect(cornerRadius: 12))
         .padding(.horizontal, 16)
+        .transition(.opacity.combined(with: .move(edge: .top)))
+    }
+}
+
+struct SpatialAudioButton: View {
+    let mode: SpatialAudioMode
+    let isSelected: Bool
+    let isDisabled: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                Image(systemName: mode.symbolName)
+                    .font(.system(size: 16))
+                Text(mode.displayName)
+                    .font(.system(size: 10))
+            }
+            .frame(maxWidth: .infinity, minHeight: 44)
+            .foregroundStyle(isSelected ? .white : .primary)
+            .background {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(isSelected ? AnyShapeStyle(.tint) : AnyShapeStyle(.quinary))
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .animation(.snappy(duration: 0.2), value: isSelected)
     }
 }

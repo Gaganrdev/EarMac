@@ -60,6 +60,7 @@ fastlane/test_output
 *.dSYM
 *.dSYM.zip
 *.dSYM.tar.gz
+*.profraw
 
 # Opencode / AI tools
 .opencode/

@@ -91,6 +91,82 @@ extension EarResponse {
         return ANCMode.fromWireValue(payload[1])
     }
 
+    func parseEQPreset() -> EQPreset? {
+        if payload.count > 1 {
+            return EQPreset.fromWireValue(payload[1])
+        } else if payload.count == 1 {
+            return EQPreset.fromWireValue(payload[0])
+        }
+        return nil
+    }
+
+    func parseCustomEQ() -> EQPresetCustom? {
+        let bassOffset = 6
+        let midOffset = 19
+        let trebleOffset = 32
+
+        func readFloat(at offset: Int) -> Float? {
+            guard payload.count >= offset + 4 else { return nil }
+            let raw = UInt32(payload[offset])
+                | (UInt32(payload[offset + 1]) << 8)
+                | (UInt32(payload[offset + 2]) << 16)
+                | (UInt32(payload[offset + 3]) << 24)
+            return Float(bitPattern: raw)
+        }
+
+        guard let bassValue = readFloat(at: bassOffset),
+              let midValue = readFloat(at: midOffset),
+              let trebleValue = readFloat(at: trebleOffset)
+        else {
+            return nil
+        }
+
+        func clamp(_ value: Int, _ min: Int, _ max: Int) -> Int {
+            Swift.max(min, Swift.min(max, value))
+        }
+
+        return EQPresetCustom(
+            bass: clamp(Int(bassValue.rounded()), -6, 6),
+            mid: clamp(Int(midValue.rounded()), -6, 6),
+            treble: clamp(Int(trebleValue.rounded()), -6, 6)
+        )
+    }
+
+    func parseAdvancedEQ() -> Bool? {
+        if payload.isEmpty { return false }
+        return payload[0] != 0
+    }
+
+    func parseSpatialAudioMode() -> SpatialAudioMode? {
+        guard !payload.isEmpty else { return nil }
+
+        if payload.count == 1 {
+            switch payload[0] {
+            case 0x00: return .off
+            case 0x01: return .fixed
+            case 0x02: return .headTracking
+            default: return nil
+            }
+        }
+
+        let first = payload[0]
+        let second = payload[1]
+
+        switch (first, second) {
+        case (0x00, 0x00): return .off
+        case (0x01, 0x00): return .fixed
+        case (0x01, 0x01): return .headTracking
+        case (0x02, 0x00): return .concert
+        case (0x03, 0x00): return .cinema
+        default: return nil
+        }
+    }
+
+    func parseInEarDetection() -> Bool? {
+        guard payload.count >= 3 else { return nil }
+        return payload[2] != 0
+    }
+
     private func parseConfigEntries() -> [(index: Int, type: Int, value: String)] {
         let candidates: [[UInt8]] = [
             payload,
